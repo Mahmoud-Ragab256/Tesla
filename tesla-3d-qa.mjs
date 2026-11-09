@@ -1,0 +1,74 @@
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import {spawn} from 'node:child_process';
+const root=path.resolve('tesla-motion/dist');
+const out=path.resolve('tesla-qa');fs.mkdirSync(out,{recursive:true});
+const mime={'.html':'text/html','.js':'text/javascript','.css':'text/css','.jpg':'image/jpeg','.png':'image/png','.svg':'image/svg+xml','.glb':'model/gltf-binary','.mp4':'video/mp4','.woff2':'font/woff2'};
+const server=http.createServer((req,res)=>{const file=path.resolve(root,'.'+decodeURIComponent(new URL(req.url,'http://localhost').pathname==='/'?'/index.html':new URL(req.url,'http://localhost').pathname));if(!file.startsWith(root+path.sep)){res.writeHead(403);res.end();return;}try{const stat=fs.statSync(file);const range=req.headers.range;const headers={'Content-Type':mime[path.extname(file)]||'application/octet-stream','Accept-Ranges':'bytes'};if(range){const [a,b]=range.replace('bytes=','').split('-');const start=Number(a),end=b?Number(b):stat.size-1;res.writeHead(206,{...headers,'Content-Range':`bytes ${start}-${end}/${stat.size}`,'Content-Length':end-start+1});fs.createReadStream(file,{start,end}).pipe(res);}else{res.writeHead(200,{...headers,'Content-Length':stat.size});fs.createReadStream(file).pipe(res);}}catch{res.writeHead(404);res.end('Not found');}});
+await new Promise(r=>server.listen(4173,'127.0.0.1',r));
+console.log('Preview: http://127.0.0.1:4173');
+const chrome=spawn('C:/Program Files/Google/Chrome/Application/chrome.exe',['--headless=new','--enable-unsafe-swiftshader','--use-angle=swiftshader','--no-first-run','--no-default-browser-check','--remote-debugging-port=9227','--user-data-dir='+path.join(out,'chrome-profile'),'about:blank'],{windowsHide:true,stdio:'ignore'});
+let socket;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+try{
+  let tab;for(let i=0;i<40;i++){try{tab=await(await fetch('http://127.0.0.1:9227/json/new?about:blank',{method:'PUT'})).json();break;}catch{await sleep(250);}}
+  if(!tab)throw Error('Chrome debugging unavailable');
+  socket=new WebSocket(tab.webSocketDebuggerUrl);await new Promise((r,j)=>{socket.onopen=r;socket.onerror=j;});
+  let seq=0;const pending=new Map(),errors=[];
+  socket.onmessage=e=>{const m=JSON.parse(e.data);if(m.id){const p=pending.get(m.id);pending.delete(m.id);if(m.error)p.reject(Error(JSON.stringify(m.error)));else p.resolve(m.result);}if(m.method==='Runtime.exceptionThrown')errors.push(m.params.exceptionDetails.text+': '+m.params.exceptionDetails.exception?.description);};
+  const send=(method,params={})=>new Promise((resolve,reject)=>{const id=++seq;pending.set(id,{resolve,reject});socket.send(JSON.stringify({id,method,params}));});
+  const evaluate=async expression=>{const r=await send('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw Error(r.exceptionDetails.exception?.description||r.exceptionDetails.text);return r.result.value;};
+  const assert=(value,message)=>{if(!value)throw Error(message);console.log('PASS '+message);};
+  await send('Runtime.enable');await send('Page.enable');
+  await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  await send('Page.navigate',{url:'http://127.0.0.1:4173/'});await sleep(2500);
+  for(let attempt=0;attempt<100;attempt++){if(await evaluate("document.querySelector('#car-scene').dataset.ready==='true'"))break;await sleep(300);}
+  console.log('Errors:',JSON.stringify(errors));
+  assert(await evaluate("document.querySelector('#car-scene').dataset.ready==='true'"),'Real 3D model loads and WebGL renders');
+  assert(await evaluate("document.querySelectorAll('video').length===0"),'Video player is fully replaced by a real 3D canvas');
+  assert(await evaluate("getComputedStyle(document.querySelector('.button')).fontSize==='14px'&&getComputedStyle(document.querySelector('.button')).borderRadius==='4px'"),'Tesla-style 14px buttons with 4px corners');
+  assert(await evaluate("document.querySelector('.wordmark img').naturalWidth>0"),'Real Tesla logo vector loads');
+  assert(await evaluate("document.documentElement.scrollWidth<=innerWidth"),'Desktop layout has no horizontal overflow');
+  await sleep(800);
+  await send('Page.captureScreenshot',{format:'png'}).then(r=>fs.writeFileSync(path.join(out,'v3-desktop-hero.png'),Buffer.from(r.data,'base64')));
+  await evaluate("document.documentElement.style.scrollBehavior='auto';window.scrollTo(0,(document.querySelector('.hero').offsetHeight-innerHeight)*.5)");
+  for(let attempt=0;attempt<50;attempt++){if(await evaluate("Math.abs(Number(document.querySelector('#car-scene').dataset.progress)-50)<5"))break;await sleep(300);}
+  console.log('3D progress',await evaluate("document.querySelector('#car-scene').dataset.progress"));
+  assert(await evaluate("Math.abs(Number(document.querySelector('#car-scene').dataset.progress)-50)<5"),'Scroll animates the 3D journey');
+  await send('Page.captureScreenshot',{format:'png'}).then(r=>fs.writeFileSync(path.join(out,'v3-desktop-motion.png'),Buffer.from(r.data,'base64')));
+  await evaluate("document.querySelector('[data-scene-paint=\"#a01620\"]').click()");
+  assert(await evaluate("document.querySelector('[data-scene-paint=\"#a01620\"]').getAttribute('aria-pressed')==='true'"),'3D paint controls update selected color');
+  await sleep(400);await send('Page.captureScreenshot',{format:'png'}).then(r=>fs.writeFileSync(path.join(out,'v3-desktop-red.png'),Buffer.from(r.data,'base64')));
+  await evaluate("document.querySelector('#scene-reset').click()");await sleep(1000);
+  await evaluate("document.querySelector('#collection').scrollIntoView({behavior:'instant'})");await sleep(400);
+  await evaluate("document.querySelector('[data-model=\"C\"]').click()");
+  for(let attempt=0;attempt<30;attempt++){if(await evaluate("document.querySelector('#model-name').textContent==='Cybertruck'&&document.querySelector('#car-image').naturalWidth>0"))break;await sleep(200);}
+  assert(await evaluate("document.querySelector('#model-name').textContent==='Cybertruck'&&document.querySelector('#car-image').naturalWidth>0"),'Vehicle model switching still works');
+  await evaluate("document.querySelector('#vehicle-panel').scrollIntoView({behavior:'instant',block:'center'})");await sleep(1100);
+  await send('Page.captureScreenshot',{format:'png'}).then(r=>fs.writeFileSync(path.join(out,'v3-desktop-collection.png'),Buffer.from(r.data,'base64')));
+  await evaluate("document.querySelector('#configure').click();document.querySelector('[data-color=\"Deep Red\"]').click()");
+  assert(await evaluate("document.querySelector('#color-name').textContent==='Deep Red'&&document.querySelector('dialog').open"),'Configuration and color selection work');
+  await evaluate("document.querySelector('#config-book').click();document.querySelector('[name=\"name\"]').value='Test Driver';document.querySelector('[name=\"email\"]').value='driver@example.com';document.querySelector('form').requestSubmit()");
+  assert(await evaluate("document.querySelector('#request-summary').textContent.includes('Cybertruck')"),'Booking preview preserves the chosen model');
+  await evaluate("document.querySelector('dialog').close();document.querySelector('[data-product=\"wall\"]').click()");
+  assert(await evaluate("document.querySelector('#dialog-title').textContent==='Wall Connector'"),'Energy product details work');
+  await evaluate("document.querySelector('dialog').close();document.querySelector('#products').scrollIntoView({behavior:'instant'})");await sleep(1000);
+  assert(await evaluate("Array.from(document.images).every(img=>img.complete&&img.naturalWidth>0)"),'All vehicle, brand and energy images load');
+  await send('Page.captureScreenshot',{format:'png'}).then(r=>fs.writeFileSync(path.join(out,'v3-desktop-products.png'),Buffer.from(r.data,'base64')));
+  await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  await evaluate("window.scrollTo(0,0)");await sleep(1200);
+  assert(await evaluate("document.documentElement.scrollWidth<=innerWidth"),'Mobile layout has no horizontal overflow');
+  await send('Page.captureScreenshot',{format:'png'}).then(r=>fs.writeFileSync(path.join(out,'v3-mobile-hero.png'),Buffer.from(r.data,'base64')));
+  await evaluate("document.querySelector('.menu').click()");
+  assert(await evaluate("document.querySelector('.menu').getAttribute('aria-expanded')==='true'"),'Mobile menu opens');
+  await evaluate("document.querySelector('nav a[href=\"#products\"]').click()");await sleep(1000);
+  assert(await evaluate("!document.querySelector('nav').classList.contains('open')&&location.hash==='#products'"),'Mobile navigation scrolls and closes');
+  console.log('Mobile header',await evaluate("({scroll:scrollY,classes:document.querySelector('header').className,color:getComputedStyle(document.querySelector('header')).color,logo:getComputedStyle(document.querySelector('.wordmark img')).filter})"));
+  assert(await evaluate("document.querySelector('header').classList.contains('scrolled')&&getComputedStyle(document.querySelector('.wordmark img')).filter==='brightness(0)'"),'Mobile header maintains visible logo on light sections');
+  await send('Page.captureScreenshot',{format:'png'}).then(r=>fs.writeFileSync(path.join(out,'v3-mobile-products.png'),Buffer.from(r.data,'base64')));
+  await send('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});await sleep(600);
+  await evaluate("window.scrollTo(0,0)");await sleep(300);
+  assert(await evaluate("Math.abs(document.querySelector('.hero').offsetHeight-innerHeight)<3&&document.querySelector('#car-scene').dataset.progress==='0'"),'Reduced motion shows a still 3D view');
+  assert(errors.length===0,'No JavaScript runtime errors');console.log('QA complete');
+}finally{if(socket)socket.close();chrome.kill();server.close();}

@@ -1,0 +1,10 @@
+/.tesla-tools/
+/tesla-qa/
+/*.tar.gz
+/*.zip
+/*.mp4
+/*.mov
+/*.webm
+**/.env
+**/.env.*
+!**/.env.example
