@@ -1,4 +1,5 @@
 /.tesla-tools/
+/.vercel/
 /tesla-qa/
 /*.tar.gz
 /*.zip
